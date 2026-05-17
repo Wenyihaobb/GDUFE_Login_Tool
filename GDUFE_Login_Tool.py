@@ -3,20 +3,60 @@ import sys
 from typing import Optional
 import requests
 import socket
+import json
+import base64
 from bs4 import BeautifulSoup
+from cryptography.fernet import Fernet
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton, QCheckBox, \
-    QMessageBox, QSystemTrayIcon, QMenu, QDialog, QDialogButtonBox, QHBoxLayout, QSpinBox
+from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton, QCheckBox, QMessageBox, QSystemTrayIcon, QMenu, QDialog, QDialogButtonBox, QHBoxLayout, QSpinBox
 from PySide6.QtGui import QIcon, QAction
 from plyer import notification
 import os
 import winreg
 
+
 # 配置文件存储在用户主目录下的隐藏目录 ".gdufe_login" 中
 config_dir = os.path.expanduser(os.path.join("~", ".gdufe_login"))
 os.makedirs(config_dir, exist_ok=True)  # 确保目录存在
 CONFIG_FILE = os.path.join(config_dir, 'user_config.ini')
+KEY_FILE = os.path.join(config_dir, 'secret.key')
 
+
+def get_encryption_key():
+    """获取或生成加密密钥"""
+    if os.path.exists(KEY_FILE):
+        with open(KEY_FILE, 'rb') as key_file:
+            return key_file.read()
+    else:
+        key = Fernet.generate_key()
+        with open(KEY_FILE, 'wb') as key_file:
+            key_file.write(key)
+        return key
+
+
+def encrypt_password(password: str) -> str:
+    """加密密码"""
+    if not password:
+        return ''
+    key = get_encryption_key()
+    fernet = Fernet(key)
+    encrypted = fernet.encrypt(password.encode())
+    return base64.urlsafe_b64encode(encrypted).decode()
+
+
+def decrypt_password(encrypted_password: str) -> str:
+    """解密密码"""
+    if not encrypted_password:
+        return ''
+    try:
+        key = get_encryption_key()
+        fernet = Fernet(key)
+        decoded = base64.urlsafe_b64decode(encrypted_password.encode())
+        decrypted = fernet.decrypt(decoded)
+        return decrypted.decode()
+    except Exception:
+        # 如果解密失败（可能是旧版本的明文密码），返回原值
+        return encrypted_password
 
 def check_login_status():
     try:
@@ -35,11 +75,18 @@ def check_login_status():
 def get_local_ip():
     """获取本机IP地址"""
     try:
-        hostname = socket.gethostname()
-        local_ip = socket.gethostbyname(hostname)
-        return local_ip
-    except Exception:
+        # 创建一个socket连接，通过这个连接获取本机IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # 连接一个公共的服务器地址，不需要真正连接
+        s.connect(("1.1.1.1", 80))
+        # 获取本机的IP地址
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except(socket.error, OSError):
+        # 如果获取失败，返回默认IP
         return "0.0.0.0"
+
 
 def clear_user_info():
     """清除用户信息"""
@@ -59,7 +106,8 @@ def quit_application():
 def check_network_status_after_login():
     """登录后检查网络状态并更新界面"""
     # 仅处理通知，不再改变界面状态
-    if check_login_status():
+    status = check_login_status()
+    if status == "logged_in":
         notification.notify(
             title='登录',
             message='登录成功，已连接到校园网',
@@ -79,8 +127,6 @@ class CampusNetLogin(QWidget):
         self.reconnect_timer = QTimer()
         self.reconnect_timer.timeout.connect(self.check_reconnect)
         self.autoReconnectCheckbox = None  # 预声明变量
-        self.settingsLink = None
-        self.tray_icon = QSystemTrayIcon(self)
         self.settingsLink = QLabel('<a href="#">设置</a>')
         self.tray_icon = QSystemTrayIcon(self)
         self.userLabel = QLabel('用户名:')
@@ -96,6 +142,7 @@ class CampusNetLogin(QWidget):
         self.autoReconnectCheckbox.stateChanged.connect(self.on_auto_reconnect_changed)  # 新增信号连接
         self.loginButton = QPushButton('登录')
         self.logoutButton = QPushButton('注销')
+        self.icon_path = self.get_icon_path()  # 提取图标路径
         self.initui()  # 初始化界面布局
         self.load_user_info()
         # 新增对开机启动参数的检测
@@ -107,6 +154,10 @@ class CampusNetLogin(QWidget):
         self.setup_tray_icon()
         self.first_close = True
         self.exit_requested = False  # 新增退出请求标记
+
+    def get_icon_path(self):
+        """获取图标文件路径"""
+        return os.path.join(getattr(sys, '_MEIPASS', os.path.abspath(".")), 'favicon.ico')
 
     def initui(self):
         self.layout.addWidget(self.userLabel)
@@ -128,8 +179,7 @@ class CampusNetLogin(QWidget):
         self.layout.addWidget(self.logoutButton)
         self.setLayout(self.layout)  # 设置布局
         self.setWindowTitle('GDUFE Login Tool')
-        icon_path = os.path.join(getattr(sys, '_MEIPASS', os.path.abspath(".")), 'favicon.ico')
-        self.setWindowIcon(QIcon(icon_path))
+        self.setWindowIcon(QIcon(self.icon_path))
         self.show()
 
     def load_user_info(self):
@@ -138,7 +188,9 @@ class CampusNetLogin(QWidget):
         if config.read(CONFIG_FILE):
             try:
                 username = config.get('Credentials', 'username')
-                password = config.get('Credentials', 'password')
+                encrypted_password = config.get('Credentials', 'password')
+                # 解密密码（兼容旧版本的明文密码）
+                password = decrypt_password(encrypted_password)
                 remember = config.getboolean('Credentials', 'remember')
                 auto_start = config.getboolean('Credentials', 'auto_start')
                 auto_login = config.getboolean('Credentials', 'auto_login', fallback=False)
@@ -160,9 +212,11 @@ class CampusNetLogin(QWidget):
     def save_user_info(self):
         """保存用户信息"""
         config = configparser.ConfigParser()
+        # 加密密码后保存
+        encrypted_password = encrypt_password(self.passInput.text())
         config['Credentials'] = {
             'username': self.userInput.text(),
-            'password': self.passInput.text(),
+            'password': encrypted_password,
             'remember': str(self.rememberMe.isChecked()),
             'auto_start': str(self.autoStartCheckbox.isChecked()),
             'auto_login': str(self.autoLoginCheckbox.isChecked()),  # 新增自动登录配置保存
@@ -190,33 +244,34 @@ class CampusNetLogin(QWidget):
             key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
             app_name = "GDUFE Login Tool"
             exe_path = os.path.abspath(sys.argv[0])
-
+            
             try:
                 # 打开注册表键
                 key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
-
+                
                 if enabled:
                     # 写入注册表值
                     winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, f'"{exe_path}" --autostart')
                 else:
                     # 删除注册表值
                     winreg.DeleteValue(key, app_name)
-
+                    
                 winreg.CloseKey(key)
             except Exception as e:
                 # 简单错误处理（可按需扩展）
                 QMessageBox.warning(self, "设置失败", f"无法修改注册表: {str(e)}")
 
-    def check_network_status(self):
+    def check_network_status(self, show_notification=False):
         """检查网络状态，并根据状态调整界面"""
         status = check_login_status()
-        if status == "logged_in":
-            # 新增通知弹出
-            notification.notify(
-                title='已登录',
-                message='校园网已处于登录状态',
-                timeout=5
-            )
+        if status == "logged_in" :
+            # 仅在手动检查时显示通知
+            if show_notification:
+                notification.notify(
+                    title='已登录',
+                    message='校园网已处于登录状态',
+                    timeout=5
+                )
             self.toggle_ui_elements(False, True)
             self.hide()  # 隐藏窗口
         else:
@@ -234,10 +289,10 @@ class CampusNetLogin(QWidget):
         username = self.userInput.text()
         password = self.passInput.text()
         login_url = "http://100.64.13.17:801/eportal/portal/login"
-
+        
         # 获取当前IP地址
         user_ip = get_local_ip()
-
+        
         params = {
             'callback': 'dr1003',
             'login_method': '1',
@@ -257,49 +312,58 @@ class CampusNetLogin(QWidget):
             "Referer": "http://100.64.64.17/"
         }
 
-        response = requests.get(login_url, params=params, headers=headers)
-        print(response.text)
-
-        # 新增JSON解析逻辑
-        import json
-        response_str = response.text.strip()
-        start = response_str.find('(') + 1
-        end = response_str.rfind(')')
-        json_str = response_str[start:end]
         try:
-            data = json.loads(json_str)
-            if data.get('result') == 1 or data.get('msg') == 'AC999':
-                # 登录成功处理
-                if self.rememberMe.isChecked():
-                    self.save_user_info()
+            response = requests.get(login_url, params=params, headers=headers, timeout=10)
+            print(response.text)
+
+            # 新增JSON解析逻辑
+            response_str = response.text.strip()
+            start = response_str.find('(') + 1
+            end = response_str.rfind(')')
+            json_str = response_str[start:end]
+            try:
+                data = json.loads(json_str)
+                if data.get('result') == 1 or data.get('msg') == 'AC999':
+                    # 登录成功处理
+                    if self.rememberMe.isChecked():
+                        self.save_user_info()
+                    else:
+                        clear_user_info()
+
+                    # 立即更新界面状态并隐藏窗口
+                    self.toggle_ui_elements(False, True)
+                    self.hide()  # 隐藏窗口
+                    
+                    # 保留定时器用于通知
+                    QTimer.singleShot(1000, lambda: check_network_status_after_login())
                 else:
-                    clear_user_info()
-
-                # 立即更新界面状态并隐藏窗口
-                self.toggle_ui_elements(False, True)
-                self.hide()  # 隐藏窗口
-
-                # 保留定时器用于通知
-                QTimer.singleShot(1000, lambda: check_network_status_after_login())
-            else:
-                # 登录失败处理
-                QMessageBox.critical(self, "错误", "登录失败，请检查用户名和密码")
-                notification.notify(
-                    title='登录',
-                    message='登录失败，请检查用户名和密码',
-                    timeout=5
-                )
-                self.toggle_ui_elements(True, False)  # 保持登录控件可用
-        except json.JSONDecodeError:
-            QMessageBox.critical(self, "错误", "登录失败，响应格式异常")
+                    # 登录失败处理
+                    QMessageBox.critical(self, "错误", "登录失败，请检查用户名和密码")
+                    notification.notify(
+                        title='登录',
+                        message='登录失败，请检查用户名和密码',
+                        timeout=5
+                    )
+                    self.toggle_ui_elements(True, False)  # 保持登录控件可用
+            except json.JSONDecodeError:
+                QMessageBox.critical(self, "错误", "登录失败，响应格式异常")
+                self.toggle_ui_elements(True, False)
+        except requests.exceptions.Timeout:
+            QMessageBox.critical(self, "错误", "登录超时，请检查网络连接")
+            self.toggle_ui_elements(True, False)
+        except requests.exceptions.ConnectionError:
+            QMessageBox.critical(self, "错误", "无法连接到服务器，请检查网络")
+            self.toggle_ui_elements(True, False)
+        except requests.exceptions.RequestException as e:
+            QMessageBox.critical(self, "错误", f"登录请求失败: {str(e)}")
             self.toggle_ui_elements(True, False)
 
     def do_logout(self):
         logout_url = "http://100.64.13.17:801/eportal/portal/logout"
-
+        
         # 获取当前IP地址
         user_ip = get_local_ip()
-
+        
         params = {
             'callback': 'dr1004',
             'login_method': '1',
@@ -319,56 +383,65 @@ class CampusNetLogin(QWidget):
             "Accept-Encoding": "gzip, deflate",
             "Accept-Language": "zh-CN,zh-TW;q=0.9,zh;q=0.8,en-US;q=0.7,en;q=0.6",
         }
-        response = requests.get(logout_url, params=params, headers=headers)
-        print(response.text)
-        # 假设注销总是成功的
-        self.toggle_ui_elements(True, False)  # 启用登录相关控件，禁用注销按钮
-        # 添加注销通知
-        notification.notify(
-            title='注销',
-            message='校园网已注销',
-            timeout=5
-        )
+        try:
+            response = requests.get(logout_url, params=params, headers=headers, timeout=10)
+            print(response.text)
+            # 假设注销总是成功的
+            self.toggle_ui_elements(True, False)  # 启用登录相关控件，禁用注销按钮
+            # 添加注销通知
+            notification.notify(
+                title='注销',
+                message='校园网已注销',
+                timeout=5
+            )
+        except requests.exceptions.Timeout:
+            QMessageBox.warning(self, "警告", "注销超时，但可能已成功")
+            self.toggle_ui_elements(True, False)
+        except requests.exceptions.ConnectionError:
+            QMessageBox.warning(self, "警告", "无法连接到服务器，但可能已注销")
+            self.toggle_ui_elements(True, False)
+        except requests.exceptions.RequestException as e:
+            QMessageBox.warning(self, "警告", f"注销请求异常: {str(e)}")
+            self.toggle_ui_elements(True, False)
 
     def setup_tray_icon(self):
         """设置系统托盘图标"""
-        # 使用指定的favicon.ico图标
-        icon_path = os.path.join(getattr(sys, '_MEIPASS', os.path.abspath(".")), 'favicon.ico')
-        self.tray_icon.setIcon(QIcon(icon_path))
-
+        # 使用类常量中的图标路径
+        self.tray_icon.setIcon(QIcon(self.icon_path))
+            
         # 创建托盘菜单
         tray_menu = QMenu()
-
-        # 添加"显示"菜单项
+            
+        # 添加“显示”菜单项
         show_action = QAction("显示窗口", self)
         show_action.triggered.connect(self.show)
         tray_menu.addAction(show_action)
-
+            
         # 添加分隔线
         tray_menu.addSeparator()
-
-        # 添加"注销"菜单项
-        logout_action = QAction("注销", self)
-        logout_action.triggered.connect(self.do_logout)
-        tray_menu.addAction(logout_action)
-
+            
+        # 添加“注销”菜单项（保存引用以便动态启用/禁用）
+        self.logout_action = QAction("注销", self)
+        self.logout_action.triggered.connect(self.do_logout)
+        tray_menu.addAction(self.logout_action)
+            
         # 添加分隔线
         tray_menu.addSeparator()
-
-        # 添加"退出"菜单项
+            
+        # 添加“退出”菜单项
         quit_action = QAction("退出", self)
         quit_action.triggered.connect(self.request_exit)  # 修改为连接到新方法
         tray_menu.addAction(quit_action)
-
+            
         # 设置托盘图标的菜单
         self.tray_icon.setContextMenu(tray_menu)
-
+            
         # 设置托盘图标的提示文字
         self.tray_icon.setToolTip("GDUFE Login Tool")
-
+            
         # 显示托盘图标
         self.tray_icon.show()
-
+            
         # 连接托盘图标的激活信号（双击或点击）
         self.tray_icon.activated.connect(self.tray_icon_activated)
 
@@ -431,13 +504,40 @@ class CampusNetLogin(QWidget):
         status = check_login_status()
 
         if status == "logged_out":  # 检测到未登录状态
+            # 检查是否有保存的凭证
+            config = configparser.ConfigParser()
+            if not config.read(CONFIG_FILE) or 'Credentials' not in config:
+                notification.notify(
+                    title='重连失败',
+                    message='未找到保存的登录凭证，请手动登录',
+                    timeout=5
+                )
+                self.toggle_reconnect_timer(False)
+                self.autoReconnectCheckbox.setChecked(False)
+                return
+            
+            username = config.get('Credentials', 'username', fallback='')
+            encrypted_password = config.get('Credentials', 'password', fallback='')
+            # 解密密码（兼容旧版本的明文密码）
+            password = decrypt_password(encrypted_password)
+            
+            if not username or not password:
+                notification.notify(
+                    title='重连失败',
+                    message='登录凭证不完整，请手动登录',
+                    timeout=5
+                )
+                self.toggle_reconnect_timer(False)
+                self.autoReconnectCheckbox.setChecked(False)
+                return
+            
             self.reconnect_retry_count += 1
             max_retries = 5
 
             if self.reconnect_retry_count >= max_retries:
                 notification.notify(
                     title='重连失败',
-                    message='尝试{max_retries}次失败，请检查网络后手动登录',
+                    message=f'尝试{max_retries}次失败，请检查网络后手动登录',
                     timeout=5
                 )
                 self.reconnect_retry_count = 0
@@ -456,12 +556,21 @@ class CampusNetLogin(QWidget):
         dialog = SettingsDialog(self)
         if dialog.exec():
             # 同步设置到主窗口
+            old_auto_reconnect = self.autoReconnectCheckbox.isChecked()
             self.autoStartCheckbox.setChecked(dialog.auto_start.isChecked())
             self.autoLoginCheckbox.setChecked(dialog.auto_login.isChecked())
             self.autoReconnectCheckbox.setChecked(dialog.auto_reconnect.isChecked())
             self.reconnect_interval = dialog.reconnect_interval.value()  # 新增同步间隔时间
+            
+            # 如果自动重连状态发生变化，更新定时器
+            if old_auto_reconnect != self.autoReconnectCheckbox.isChecked():
+                self.toggle_reconnect_timer(self.autoReconnectCheckbox.isChecked())
+            elif self.autoReconnectCheckbox.isChecked():
+                # 如果重连已启用但间隔时间变化，重启定时器
+                self.toggle_reconnect_timer(False)
+                self.toggle_reconnect_timer(True)
+            
             self.save_user_info()  # 保存新配置
-
 
 # 新增设置对话框类
 class SettingsDialog(QDialog):
@@ -469,14 +578,14 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.layout = QVBoxLayout()
-
+        
         self.auto_start = QCheckBox("开机启动")
         self.auto_login = QCheckBox("自动登录")
         self.auto_reconnect = QCheckBox("自动重连")
         self.reconnect_interval = QSpinBox()  # 新增间隔时间输入框
         self.reconnect_interval.setRange(1, 3600)  # 设置范围为1秒到1小时
         self.reconnect_interval.setSuffix(" 秒")  # 设置单位
-
+        
         # 初始化当前值
         checkbox_pairs = [
             (self.auto_start, 'autoStartCheckbox'),
@@ -487,16 +596,16 @@ class SettingsDialog(QDialog):
             parent_checkbox = getattr(parent, parent_attr)
             child.setChecked(parent_checkbox.isChecked())
         self.reconnect_interval.setValue(parent.reconnect_interval)  # 初始化间隔时间
-
+        
         # 设置联动关系
         self.auto_login.setEnabled(self.auto_start.isChecked())
         self.auto_start.stateChanged.connect(self.on_auto_start_changed)
-
+        
         self.layout.addWidget(self.auto_start)
         self.layout.addWidget(self.auto_login)
         self.layout.addWidget(self.auto_reconnect)
         self.layout.addWidget(self.reconnect_interval)  # 添加间隔时间输入框
-
+        
         # 添加按钮
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -504,7 +613,7 @@ class SettingsDialog(QDialog):
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
         self.layout.addWidget(button_box)
-
+        
         self.setLayout(self.layout)
 
     def on_auto_start_changed(self, state):
